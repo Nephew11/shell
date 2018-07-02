@@ -15,8 +15,10 @@
 // along with Parity.  If not, see <http://www.gnu.org/licenses/>.
 
 const electron = require('electron');
+const fs = require('fs');
 const path = require('path');
 const url = require('url');
+const util = require('util');
 
 const addMenu = require('./menu');
 const { cli } = require('./cli');
@@ -25,8 +27,14 @@ const fetchParity = require('./operations/fetchParity');
 const handleError = require('./operations/handleError');
 const messages = require('./messages');
 const { killParity } = require('./operations/runParity');
+const { getLocalDappsPath } = require('./utils/paths');
+const { name: appName } = require('../package.json');
 
 const { app, BrowserWindow, ipcMain, session } = electron;
+
+const fsExists = util.promisify(fs.stat); // eslint-disable-line
+const fsMkdir = util.promisify(fs.mkdir);
+
 let mainWindow;
 
 function createWindow () {
@@ -39,6 +47,11 @@ function createWindow () {
     height: 800,
     width: 1200
   });
+
+  const localDappsPath = getLocalDappsPath();
+
+  fsExists(localDappsPath)
+    .catch(() => fsMkdir(localDappsPath));
 
   doesParityExist()
     .catch(() => fetchParity(mainWindow)) // Install parity if not present
@@ -74,6 +87,36 @@ function createWindow () {
     callback({ requestHeaders: details.requestHeaders });
   });
 
+  // Do not accept all kind of web permissions (camera, location...)
+  // https://electronjs.org/docs/tutorial/security#4-handle-session-permission-requests-from-remote-content
+  session.defaultSession
+    .setPermissionRequestHandler((webContents, permission, callback) => {
+      if (!webContents.getURL().startsWith('file:')) {
+        // Denies the permissions request for all non-file://. Currently all
+        // network dapps are loaded on http://127.0.0.1:8545, so they won't
+        // have any permissions.
+        return callback(false);
+      }
+
+      // All others loaded on file:// (shell, builtin, local) can have those
+      // permissions.
+      return callback(true);
+    });
+
+  // Verify WebView Options Before Creation
+  // https://electronjs.org/docs/tutorial/security#12-verify-webview-options-before-creation
+  mainWindow.webContents.on('will-attach-webview', (event, webPreferences, params) => {
+    // Strip away inline preload scripts, ours is at preloadURL
+    delete webPreferences.preload;
+
+    // TODO Verify that the location of webPreferences.preloadURL is:
+    // `file://path/to/app.asar/.build/preload.js`
+
+    // Disable Node.js integration
+    webPreferences.nodeIntegration = false;
+    webPreferences.contextIsolation = true;
+  });
+
   mainWindow.on('closed', () => {
     mainWindow = null;
   });
@@ -98,3 +141,10 @@ app.on('activate', () => {
     createWindow();
   }
 });
+
+// userData value is derived from the Electron app name by default. However,
+// Electron doesn't know the app name defined in package.json because we
+// execute Electron directly on a file. Running Electron on a folder (either
+// .build/ or electron/) doesn't solve the issue because the package.json
+// is located in the parent directory.
+app.setPath('userData', path.join(app.getPath('appData'), appName));
